@@ -1,11 +1,6 @@
-## My Project
+## Solution Overview
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+This repository holds the code of the artifact [Get Organizational wide visibility of your IAM Credential Reports](https://apg-library.amazonaws.com/content-viewer/author/8724ff28-40f6-4c43-9c65-fbd18bbbfd). It provides you prescriptive guidance to create IAM credential reports from all AWS accounts and stores them at a central location. This solution uses Amazon QuickSight to create dashboards enabling you to audit the IAM credentials at scale.
 
 ## Security
 

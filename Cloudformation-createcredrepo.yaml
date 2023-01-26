@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "A template to analyze credential reports across the org"
+Parameters:
+  S3BucketName:
+    Description: "Name of S3 bucket"
+    Type: String
+    MinLength: '1'
+    MaxLength: '63'
+    Default: 'cfn-iamcredreport'
+  IAMRoleName:
+    Description: "Role Name for Lambda to assume in all accounts of Org"
+    Type: String
+    MinLength: '1'
+    MaxLength: '63'
+    Default: 'iam-credential-report-lambda-role1'
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref S3BucketName
+      Tags: 
+            - 
+              Key: "ProjectName"
+              Value: "iam-cred-report"
+      VersioningConfiguration:
+        Status: Enabled
+    
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+      - PolicyName: LambdaS3Access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:PutMetricFilter'
+              - 's3:PutObject'
+              - 'logs:CreateLogStream'
+              - 'logs:StartQuery'
+              - 'logs:GetLogEvents'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+              - 's3:PutObjectAcl'
+            Resource: 
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - !Sub 'arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/createstorecredreps:*'
+              - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+          - Effect: Allow
+            Action:
+              - 'organizations:ListAccounts'
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Resource: !Join ["",["arn:aws:iam::*:role/",!Ref IAMRoleName]]
+      Tags: 
+          - 
+            Key: "ProjectName"
+            Value: "iam-cred-report"
+      Description: Role for lambda to assume
+      RoleName: !Sub ${AWS::StackName}-CredRepLambda
+
+  CredRepLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      FunctionName: !Sub ${AWS::StackName}-createcredreps
+      Code:
+        ZipFile: |
+          ## coding=utf-8
+          ## Import boto3 and start clients
+          import os
+          import boto3
+          import time
+          from botocore.exceptions import ClientError
+          from datetime import date
+
+          ## Define Organization and STS Clients
+          orgClient = boto3.client('organizations')
+          stsClient = boto3.client('sts')
+
+          ## Define current date
+          today = str(date.today())
+
+          ## Read environment Variables of Lambda Function
+          bucketName = os.environ['BUCKETNAME']
+          crossaccountiamrolename = os.environ['ROLENAME']
+
+          ## Setup bucket for storing reports
+          s3 = boto3.resource('s3')
+          bucketConnection = s3.Bucket(bucketName)
+          
+
+          listedAccounts = orgClient.list_accounts()
+
+
+          failedAccounts = []
+
+
+          def assumeRole(accountId):
+              try:
+                  assumedRoleObject=stsClient.assume_role(
+                  RoleArn=f"arn:aws:iam::{accountId}:role/crossaccountiamrolename",
+                  RoleSessionName="IAMCredentialReport")
+                  credentials=assumedRoleObject['Credentials']
+
+                  iamClient=boto3.client('iam',
+                  aws_access_key_id=credentials['AccessKeyId'],
+                  aws_secret_access_key=credentials['SecretAccessKey'],
+                  aws_session_token=credentials['SessionToken'])
+
+                  # Generate Credential Report
+                  reportcomplete = False
+                  while not reportcomplete:
+                    gencredentialreport = iamClient.generate_credential_report()
+                    print('IAM credential report successfully generated for account Id: ' + accountId)
+                    reportcomplete = gencredentialreport['State'] == 'COMPLETE'
+                    time.sleep (1)
+                  
+                  # Obtain credential report and send to S3 
+                  if gencredentialreport['State'] == 'COMPLETE':
+                      credentialReport = iamClient.get_credential_report()
+                      decodedCredentialReport = credentialReport['Content'].decode("utf-8")
+                      ## Save credential Report into CSV file
+                      reportFileName = f"credentialReport_{accountId}.csv"
+                      try:
+                          with open("/tmp/"+reportFileName, "w") as file:
+                              file.write(decodedCredentialReport)
+                          s3.Object(bucketName, today+"/"+accountId+"/"+reportFileName).put(Body=open("/tmp/"+reportFileName, 'rb'),ACL='bucket-owner-full-control')
+                      except Exception as err:
+                          print (err)
+                      return reportFileName
+
+
+              except ClientError as error:
+                  failedAccounts.append(accountId)
+                  print(error)
+                  pass
+
+          def lambda_handler(event, context):
+              for account in listedAccounts['Accounts']:
+                  if account['Status'] != 'SUSPENDED':
+                      assumeRole(account['Id'])
+              assumeRole("285731477250")
+              return("Completed! Failed Accounts: ", failedAccounts)
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKETNAME: !Ref S3BucketName
+          ROLENAME: !Ref IAMRoleName
+
+    
+  LambdatriggerScheduledRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: "rate(1 day)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "CredRepLambda"
+              - "Arn"
+          Id: "TargetFunctionV1"
+            
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "CredRepLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "LambdatriggerScheduledRule"
+          - "Arn"
+
+  GlueRole: 
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: Allow
+            Principal: 
+              Service: 
+                - glue.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        - PolicyName: cfn-credreppol
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${AWS::StackName}-iamcredreportdb 
+        Description: "AWS Glue container to hold metadata tables for the Iam Credential report crawler"
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties: 
+      Name: !Sub ${AWS::StackName}-iam-creds-crawler
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      Role: !GetAtt GlueRole.Arn 
+      DatabaseName: iamcredreportdb
+      Description: For crawling iam credential reports from S3
+      Targets:
+        S3Targets:
+          # S3 bucket with the Credential data
+          - Path: !Join ["", [!Ref S3BucketName, "/"] ]
+      SchemaChangePolicy:
+        UpdateBehavior: "LOG"
+        DeleteBehavior: "LOG"
+      Schedule:
+        ScheduleExpression: cron(00 01 * * ? *)
+
+Outputs:
+  IAMRoleName:
+    Value: !Ref IAMRoleName
+    Description: Name of IAM Role that should be present in all accounts
+  S3BucketName:
+    Value: !Ref S3Bucket
+    Description: Name of the S3 bucket that would store the Credential reports
+  LambdaFunction:
+    Value: !Ref CredRepLambda
+    Description: Lambda that runs on schedule to create and store Credentials reports on S3 bucket
+  LambdaRole:
+    Value: !GetAtt LambdaRole.Arn
+    Description: ARN of Lambda Role. Please use it in Trust policy.
