@@ -20,12 +20,17 @@ Resources:
     DeletionPolicy: Retain
     Properties:
       BucketName: !Ref S3BucketName
+      BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
       Tags: 
             - 
               Key: "ProjectName"
               Value: "iam-cred-report"
       VersioningConfiguration:
         Status: Enabled
+      
     
   LambdaRole:
     Type: AWS::IAM::Role
