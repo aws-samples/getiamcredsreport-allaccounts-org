@@ -72,6 +72,18 @@ Resources:
             Action:
               - 'sts:AssumeRole'
             Resource: !Join ["",["arn:aws:iam::*:role/",!Ref IAMRoleName]]
+          - Effect: Allow
+            Action:
+              - 's3:ListBucket'
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3BucketName}'
+          - Effect: Allow
+            Action:
+              - 's3:PutObject'
+              - 's3:GetObject'
+              - 's3:DeleteObject'
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3BucketName}/*'
       Tags: 
           - 
             Key: "ProjectName"
@@ -111,7 +123,22 @@ Resources:
           bucketConnection = s3.Bucket(bucketName)
           
 
-          listedAccounts = orgClient.list_accounts()
+          # Get a list of all member accounts in the organization
+          listedAccounts = []
+          next_token = None
+
+          while True:
+              if next_token:
+                  response = orgClient.list_accounts(NextToken=next_token)
+              else:
+                  response = orgClient.list_accounts()
+
+              listedAccounts.extend(response['Accounts'])
+
+              next_token = response.get('NextToken')
+
+              if not next_token:
+                  break
 
 
           failedAccounts = []
@@ -120,7 +147,7 @@ Resources:
           def assumeRole(accountId):
               try:
                   assumedRoleObject=stsClient.assume_role(
-                  RoleArn=f"arn:aws:iam::{accountId}:role/crossaccountiamrolename",
+                  RoleArn=f"arn:aws:iam::{accountId}:role/{crossaccountiamrolename}",
                   RoleSessionName="IAMCredentialReport")
                   credentials=assumedRoleObject['Credentials']
 
@@ -158,10 +185,9 @@ Resources:
                   pass
 
           def lambda_handler(event, context):
-              for account in listedAccounts['Accounts']:
+              for account in listedAccounts:
                   if account['Status'] != 'SUSPENDED':
                       assumeRole(account['Id'])
-              assumeRole("285731477250")
               return("Completed! Failed Accounts: ", failedAccounts)
       Runtime: python3.9
       Timeout: 300
