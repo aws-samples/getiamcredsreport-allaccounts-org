@@ -72,6 +72,18 @@ Resources:
             Action:
               - 'sts:AssumeRole'
             Resource: !Join ["",["arn:aws:iam::*:role/",!Ref IAMRoleName]]
+          - Effect: Allow
+            Action:
+              - 's3:ListBucket'
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3BucketName}'
+          - Effect: Allow
+            Action:
+              - 's3:PutObject'
+              - 's3:GetObject'
+              - 's3:DeleteObject'
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3BucketName}/*'
       Tags: 
           - 
             Key: "ProjectName"
@@ -175,7 +187,6 @@ Resources:
           def lambda_handler(event, context):
               for account in listedAccounts:
                   if account['Status'] != 'SUSPENDED':
-                      print(account['Id'])
                       assumeRole(account['Id'])
               return("Completed! Failed Accounts: ", failedAccounts)
       Runtime: python3.9
