@@ -158,10 +158,10 @@ Resources:
                   pass
 
           def lambda_handler(event, context):
-              for account in listedAccounts['Accounts']:
-                  if account['Status'] != 'SUSPENDED':
-                      assumeRole(account['Id'])
-              assumeRole("285731477250")
+              for page in page_iterator:                 ## New code that iterates the pages
+                for account in page['Accounts']:
+                    if account['Status'] != 'SUSPENDED':
+                        assumeRole(account['Id'])
               return("Completed! Failed Accounts: ", failedAccounts)
       Runtime: python3.9
       Timeout: 300
