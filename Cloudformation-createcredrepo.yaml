@@ -234,7 +234,7 @@ Resources:
   GlueCrawler:
     Type: AWS::Glue::Crawler
     Properties: 
-      Name: !Sub glue-iam-creds-crawler
+      Name: glue-iam-creds-crawler
       RecrawlPolicy:
         RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
       Role: !GetAtt GlueRole.Arn 
