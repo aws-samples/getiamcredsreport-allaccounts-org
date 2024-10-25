@@ -2,22 +2,23 @@ AWSTemplateFormatVersion: 2010-09-09
 Description: "A template to analyze credential reports across the org"
 Parameters:
   S3BucketName:
-    Description: "Name of S3 bucket"
+    Description: "Preferred Name for S3 bucket to be CREATED to store credential reports."
     Type: String
     MinLength: '1'
     MaxLength: '63'
-    Default: 'cfn-iamcredreport'
+    Default: 'bucketname'
   IAMRoleName:
-    Description: "Role Name for Lambda to assume in all accounts of Org"
+    Description: "Preferred Role Name for Lambda to assume in all accounts of Org. It doesn't need to be exist at this moment."
     Type: String
     MinLength: '1'
     MaxLength: '63'
-    Default: 'iam-credential-report-lambda-role1'
+    Default: 'iamcredentialrole'
 
 Resources:
   S3Bucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref S3BucketName
       BucketEncryption:
@@ -120,7 +121,7 @@ Resources:
           def assumeRole(accountId):
               try:
                   assumedRoleObject=stsClient.assume_role(
-                  RoleArn=f"arn:aws:iam::{accountId}:role/crossaccountiamrolename",
+                  RoleArn=f"arn:aws:iam::{accountId}:role/{crossaccountiamrolename}",
                   RoleSessionName="IAMCredentialReport")
                   credentials=assumedRoleObject['Credentials']
 
@@ -233,7 +234,7 @@ Resources:
   GlueCrawler:
     Type: AWS::Glue::Crawler
     Properties: 
-      Name: !Sub ${AWS::StackName}-iam-creds-crawler
+      Name: !Sub glue-iam-creds-crawler
       RecrawlPolicy:
         RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
       Role: !GetAtt GlueRole.Arn 
