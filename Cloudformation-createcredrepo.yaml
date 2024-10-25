@@ -228,13 +228,13 @@ Resources:
     Properties:
       CatalogId: !Ref AWS::AccountId
       DatabaseInput:
-        Name: !Sub ${AWS::StackName}-iamcredreportdb 
+        Name: iamcredreportdb 
         Description: "AWS Glue container to hold metadata tables for the Iam Credential report crawler"
 
   GlueCrawler:
     Type: AWS::Glue::Crawler
     Properties: 
-      Name: !Sub glue-iam-creds-crawler
+      Name: !Sub ${AWS::StackName}-glue-iam-creds-crawler
       RecrawlPolicy:
         RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
       Role: !GetAtt GlueRole.Arn 
