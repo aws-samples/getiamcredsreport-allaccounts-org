@@ -2,21 +2,101 @@ AWSTemplateFormatVersion: 2010-09-09
 Description: "A template to analyze credential reports across the org"
 Parameters:
   S3BucketName:
-    Description: "Preferred Name for S3 bucket to be CREATED to store credential reports."
+    Description: "Name of the S3 bucket to be CREATED to store credential reports. S3 bucket names are globally unique, so supply a name you own. No default is provided on purpose."
     Type: String
-    MinLength: '1'
-    MaxLength: '63'
-    Default: 'bucketname'
+    MinLength: '3'
+    MaxLength: '50'
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,48}[a-z0-9]$'
+    ConstraintDescription: "Must be a valid S3 bucket name: 3-50 characters, lowercase letters, numbers, hyphens and periods, starting and ending with a letter or number."
   IAMRoleName:
     Description: "Preferred Role Name for Lambda to assume in all accounts of Org. It doesn't need to be exist at this moment."
     Type: String
     MinLength: '1'
     MaxLength: '63'
     Default: 'iamcredentialrole'
+  OrganizationId:
+    Description: "Your AWS Organizations ID (for example, o-abc1234567). Used to restrict cross-account role assumption to accounts inside your own organization."
+    Type: String
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+    ConstraintDescription: "Must be a valid AWS Organizations ID, for example o-abc1234567."
 
 Resources:
+  # Destination for S3 server access logs from the credential report bucket.
+  # Server access log delivery requires SSE-S3 (AES256); it does not support
+  # SSE-KMS. This bucket deliberately has no LoggingConfiguration of its own,
+  # because a log bucket that logs to itself creates an infinite loop of logs.
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: "CKV_AWS_18"
+            comment: "This IS the server access log destination bucket. Amazon S3 documents that a log destination bucket must not log to itself, because that creates an infinite loop of log records. Access to this bucket is instead controlled by Block Public Access, bucket owner enforced ownership, a TLS-only bucket policy, and a log delivery grant scoped to this account and the single source bucket."
+    Properties:
+      BucketName: !Sub '${S3BucketName}-access-logs'
+      BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+            -
+              Key: "ProjectName"
+              Value: "iam-cred-report"
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Allow S3 server access log delivery, scoped to this account and to
+          # the credential report bucket only (confused deputy protection).
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}-access-logs/access-logs/*'
+            Condition:
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}'
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}-access-logs'
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}-access-logs/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
   S3Bucket:
     Type: AWS::S3::Bucket
+    # The access log bucket policy must exist before S3 will accept a
+    # LoggingConfiguration that targets it.
+    DependsOn: AccessLogsBucketPolicy
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
@@ -25,14 +105,78 @@ Resources:
           ServerSideEncryptionConfiguration:
             - ServerSideEncryptionByDefault:
                 SSEAlgorithm: AES256
-      Tags: 
-            - 
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: 'access-logs/'
+      Tags:
+            -
               Key: "ProjectName"
               Value: "iam-cred-report"
       VersioningConfiguration:
         Status: Enabled
-      
-    
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt S3Bucket.Arn
+              - !Sub '${S3Bucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  LambdaManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-CredRepLambdaPolicy
+      Description: Permissions for the credential report Lambda function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: WriteFunctionLogs
+            Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-createcredreps:*'
+          - Sid: WriteCredentialReports
+            Effect: Allow
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/*'
+          # organizations:ListAccounts does not support resource-level
+          # permissions, so "*" is the only valid resource for this action.
+          - Sid: ListOrganizationAccounts
+            Effect: Allow
+            Action: 'organizations:ListAccounts'
+            Resource: "*"
+          # The role name is the same in every member account, so the account
+          # portion of the ARN has to be a wildcard. The aws:ResourceOrgID
+          # condition keeps that wildcard inside your own organization.
+          - Sid: AssumeCredentialReportRoleInOrganizationOnly
+            Effect: Allow
+            Action: 'sts:AssumeRole'
+            Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/${IAMRoleName}'
+            Condition:
+              StringEquals:
+                'aws:ResourceOrgID': !Ref OrganizationId
+
   LambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -46,35 +190,10 @@ Resources:
             Action:
               - 'sts:AssumeRole'
       Path: /
-      Policies:
-      - PolicyName: LambdaS3Access
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action:
-              - 'logs:PutMetricFilter'
-              - 's3:PutObject'
-              - 'logs:CreateLogStream'
-              - 'logs:StartQuery'
-              - 'logs:GetLogEvents'
-              - 'logs:CreateLogGroup'
-              - 'logs:PutLogEvents'
-              - 's3:PutObjectAcl'
-            Resource: 
-              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
-              - !Sub 'arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/createstorecredreps:*'
-              - !Sub 'arn:aws:s3:::${S3BucketName}/*'
-          - Effect: Allow
-            Action:
-              - 'organizations:ListAccounts'
-            Resource: "*"
-          - Effect: Allow
-            Action:
-              - 'sts:AssumeRole'
-            Resource: !Join ["",["arn:aws:iam::*:role/",!Ref IAMRoleName]]
-      Tags: 
-          - 
+      ManagedPolicyArns:
+        - !Ref LambdaManagedPolicy
+      Tags:
+          -
             Key: "ProjectName"
             Value: "iam-cred-report"
       Description: Role for lambda to assume
@@ -88,90 +207,106 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-createcredreps
       Code:
         ZipFile: |
-          ## coding=utf-8
-          ## Import boto3 and start clients
+          # coding=utf-8
+          """Generate an IAM credential report for every active account in the
+          organization and store the reports in a central S3 bucket."""
+
           import os
-          import boto3
           import time
-          from botocore.exceptions import ClientError
           from datetime import date
 
-          ## Define Organization and STS Clients
-          orgClient = boto3.client('organizations')
-          stsClient = boto3.client('sts')
+          import boto3
+          from botocore.exceptions import ClientError
 
-          ## Define current date
-          today = str(date.today())
+          # Read environment variables of the Lambda function
+          BUCKET_NAME = os.environ['BUCKETNAME']
+          CROSS_ACCOUNT_ROLE_NAME = os.environ['ROLENAME']
 
-          ## Read environment Variables of Lambda Function
-          bucketName = os.environ['BUCKETNAME']
-          crossaccountiamrolename = os.environ['ROLENAME']
+          # Upper bound on how long to wait for IAM to finish building a report
+          MAX_REPORT_WAIT_SECONDS = 60
 
-          ## Setup bucket for storing reports
-          s3 = boto3.resource('s3')
-          bucketConnection = s3.Bucket(bucketName)
-          
-
-          listedAccounts = orgClient.list_accounts()
+          org_client = boto3.client('organizations')
+          sts_client = boto3.client('sts')
+          s3_resource = boto3.resource('s3')
 
 
-          failedAccounts = []
+          def wait_for_report(iam_client, account_id):
+              """Ask IAM for a credential report and wait until it is COMPLETE."""
+              deadline = time.monotonic() + MAX_REPORT_WAIT_SECONDS
+              while True:
+                  response = iam_client.generate_credential_report()
+                  if response['State'] == 'COMPLETE':
+                      return True
+                  if time.monotonic() >= deadline:
+                      print(f'Timed out waiting for a credential report in account {account_id}')
+                      return False
+                  time.sleep(2)
 
 
-          def assumeRole(accountId):
-              try:
-                  assumedRoleObject=stsClient.assume_role(
-                  RoleArn=f"arn:aws:iam::{accountId}:role/{crossaccountiamrolename}",
-                  RoleSessionName="IAMCredentialReport")
-                  credentials=assumedRoleObject['Credentials']
+          def collect_report(account_id, report_date):
+              """Assume the cross-account role and copy one account's report to S3."""
+              assumed_role = sts_client.assume_role(
+                  RoleArn=f'arn:aws:iam::{account_id}:role/{CROSS_ACCOUNT_ROLE_NAME}',
+                  RoleSessionName='IAMCredentialReport')
+              credentials = assumed_role['Credentials']
 
-                  iamClient=boto3.client('iam',
+              iam_client = boto3.client(
+                  'iam',
                   aws_access_key_id=credentials['AccessKeyId'],
                   aws_secret_access_key=credentials['SecretAccessKey'],
                   aws_session_token=credentials['SessionToken'])
 
-                  # Generate Credential Report
-                  reportcomplete = False
-                  while not reportcomplete:
-                    gencredentialreport = iamClient.generate_credential_report()
-                    print('IAM credential report successfully generated for account Id: ' + accountId)
-                    reportcomplete = gencredentialreport['State'] == 'COMPLETE'
-                    time.sleep (1)
-                  
-                  # Obtain credential report and send to S3 
-                  if gencredentialreport['State'] == 'COMPLETE':
-                      credentialReport = iamClient.get_credential_report()
-                      decodedCredentialReport = credentialReport['Content'].decode("utf-8")
-                      ## Save credential Report into CSV file
-                      reportFileName = f"credentialReport_{accountId}.csv"
-                      try:
-                          with open("/tmp/"+reportFileName, "w") as file:
-                              file.write(decodedCredentialReport)
-                          s3.Object(bucketName, today+"/"+accountId+"/"+reportFileName).put(Body=open("/tmp/"+reportFileName, 'rb'),ACL='bucket-owner-full-control')
-                      except Exception as err:
-                          print (err)
-                      return reportFileName
+              if not wait_for_report(iam_client, account_id):
+                  raise RuntimeError(f'Credential report did not complete for account {account_id}')
 
+              report = iam_client.get_credential_report()
+              key = f'{report_date}/{account_id}/credentialReport_{account_id}.csv'
 
-              except ClientError as error:
-                  failedAccounts.append(accountId)
-                  print(error)
-                  pass
+              # Buckets created by this template use the bucket owner enforced
+              # setting for S3 Object Ownership, so ACLs are disabled and no
+              # object ACL is sent here.
+              s3_resource.Object(BUCKET_NAME, key).put(
+                  Body=report['Content'],
+                  ContentType='text/csv',
+                  ServerSideEncryption='AES256')
+
+              print(f'Stored credential report for account {account_id} at s3://{BUCKET_NAME}/{key}')
+
 
           def lambda_handler(event, context):
-              for page in page_iterator:                 ## New code that iterates the pages
-                for account in page['Accounts']:
-                    if account['Status'] != 'SUSPENDED':
-                        assumeRole(account['Id'])
-              return("Completed! Failed Accounts: ", failedAccounts)
-      Runtime: python3.9
-      Timeout: 300
+              # Both of these are computed per invocation. At module scope they
+              # would be frozen at cold start, so a warm container would write
+              # to a stale date prefix and accumulate stale failures.
+              report_date = date.today().isoformat()
+              failed_accounts = []
+              processed = 0
+
+              paginator = org_client.get_paginator('list_accounts')
+              for page in paginator.paginate():
+                  for account in page['Accounts']:
+                      if account['Status'] != 'ACTIVE':
+                          continue
+                      account_id = account['Id']
+                      try:
+                          collect_report(account_id, report_date)
+                          processed += 1
+                      except (ClientError, RuntimeError) as error:
+                          print(f'Failed for account {account_id}: {error}')
+                          failed_accounts.append(account_id)
+
+              return {
+                  'reportDate': report_date,
+                  'accountsProcessed': processed,
+                  'failedAccounts': failed_accounts,
+              }
+      Runtime: python3.13
+      Timeout: 900
       Environment:
         Variables:
           BUCKETNAME: !Ref S3BucketName
           ROLENAME: !Ref IAMRoleName
 
-    
+
   LambdatriggerScheduledRule:
     Type: AWS::Events::Rule
     Properties: 
@@ -197,6 +332,21 @@ Resources:
           - "LambdatriggerScheduledRule"
           - "Arn"
 
+  GlueManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-GlueCredRepPolicy
+      Description: Allows the Glue crawler to read credential reports from S3
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadWriteCredentialReports
+            Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/*'
+
   GlueRole: 
     Type: "AWS::IAM::Role"
     Properties: 
@@ -210,18 +360,9 @@ Resources:
             Action: 
               - 'sts:AssumeRole'
       Path: "/"
-      Policies:
-        - PolicyName: cfn-credreppol
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: 
-                  - 's3:GetObject'
-                  - 's3:PutObject'
-                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - !Ref GlueManagedPolicy
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole'
 
   GlueDatabase:
     Type: AWS::Glue::Database
@@ -254,9 +395,15 @@ Outputs:
   IAMRoleName:
     Value: !Ref IAMRoleName
     Description: Name of IAM Role that should be present in all accounts
+  OrganizationId:
+    Value: !Ref OrganizationId
+    Description: Organization ID used to scope cross-account role assumption. Use it in the member account trust policy condition.
   S3BucketName:
     Value: !Ref S3Bucket
     Description: Name of the S3 bucket that would store the Credential reports
+  AccessLogsBucketName:
+    Value: !Ref AccessLogsBucket
+    Description: Name of the S3 bucket that stores server access logs for the credential report bucket
   LambdaFunction:
     Value: !Ref CredRepLambda
     Description: Lambda that runs on schedule to create and store Credentials reports on S3 bucket

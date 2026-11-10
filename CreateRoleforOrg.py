@@ -1,30 +1,37 @@
-import boto3, json, sys, argparse
+import argparse
+import json
+import re
+
+import boto3
 from botocore.exceptions import ClientError
+
 
 def assume_role(target_account, master_role):
     '''
       Description: Get cross account credentials for given AWS target account
       Arguments:
-          master_role_arn: Master account role ARN
+          master_role: Name of the role to assume in the target account
           target_account: Target account number
-      Returns: assubmed cross account role credentials
+      Returns: assumed cross account role credentials, or None on failure
     '''
     sts = boto3.client('sts')
     try:
         assume_role_object = sts.assume_role(
-            RoleArn="arn:aws:iam::{}:role/{}".format(target_account,master_role),
+            RoleArn="arn:aws:iam::{}:role/{}".format(target_account, master_role),
             RoleSessionName="AssumingCrossAccountRole"
         )
     except Exception as err:
         print("Error ocurred while assuming role: {}".format(err))
-        return False
+        return None
     role = dict()
     role['AccessKeyId'] = assume_role_object['Credentials']['AccessKeyId']
     role['SecretAccessKey'] = assume_role_object['Credentials']['SecretAccessKey']
     role['SessionToken'] = assume_role_object['Credentials']['SessionToken']
     return role
 
-def createrole(AccessKeyId,SecretAccessKey,SessionToken, account, lambda_role, iam_role):
+
+def createrole(AccessKeyId, SecretAccessKey, SessionToken, account, lambda_role,
+               iam_role, main_account, organization_id):
     iam_client = boto3.client('iam', 
         aws_access_key_id=AccessKeyId,
         aws_secret_access_key=SecretAccessKey, 
@@ -73,6 +80,14 @@ def createrole(AccessKeyId,SecretAccessKey,SessionToken, account, lambda_role, i
             return('Role could not be created...', error)
     
     # Trust Policy
+    #
+    # Two controls narrow who can assume this role:
+    #   1. Principal names one specific role ARN in the central account, which
+    #      is supplied as a parameter rather than hardcoded.
+    #   2. The aws:PrincipalOrgID condition requires the caller to belong to
+    #      your organization. Without it, a principal outside the organization
+    #      that happened to match the ARN pattern could obtain credentials in
+    #      every account where this role exists.
     trust_relationship_policy_another_aws_role = {
         "Version": "2012-10-17",
         "Statement": [
@@ -80,10 +95,15 @@ def createrole(AccessKeyId,SecretAccessKey,SessionToken, account, lambda_role, i
                 "Effect": "Allow",
                 "Principal": {
                     "AWS": [
-                        "arn:aws:iam::299344511603:role/"+lambda_role
+                        "arn:aws:iam::" + main_account + ":role/" + lambda_role
                     ]
                 },
-                "Action": "sts:AssumeRole"
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {
+                        "aws:PrincipalOrgID": organization_id
+                    }
+                }
             }
         ]
     }
@@ -133,6 +153,20 @@ def main():
         required=True
         )
     parser.add_argument(
+        '-ma',
+        '--mainaccount',
+        dest='mainaccount',
+        help="Please provide the 12-digit account ID of the central account that hosts the Lambda function",
+        required=True
+        )
+    parser.add_argument(
+        '-o',
+        '--orgid',
+        dest='orgid',
+        help="Please provide your AWS Organizations ID, for example o-abc1234567. It restricts role assumption to principals inside your organization",
+        required=True
+        )
+    parser.add_argument(
         '-mr',
         '--masterrole',
         dest='masterrole',
@@ -153,8 +187,14 @@ def main():
         lambda_role = args.lambdarole
         master_role = args.masterrole
         iam_role = args.credrole
-        
-    
+        main_account = args.mainaccount
+        organization_id = args.orgid
+
+        if not re.fullmatch(r'\d{12}', main_account):
+            parser.error('--mainaccount must be a 12-digit AWS account ID')
+        if not re.fullmatch(r'o-[a-z0-9]{10,32}', organization_id):
+            parser.error('--orgid must be a valid AWS Organizations ID, for example o-abc1234567')
+
         try:
             client = boto3.client('organizations')
             accountlist=[]
@@ -170,8 +210,10 @@ def main():
             for account in accountlist:
                 print ("Account Number --> ", account)
                 creds=assume_role(account, master_role)
-                if creds != False:
-                    createrole(creds['AccessKeyId'],creds['SecretAccessKey'],creds['SessionToken'], account, lambda_role, iam_role)
+                if creds is not None:
+                    createrole(creds['AccessKeyId'], creds['SecretAccessKey'],
+                               creds['SessionToken'], account, lambda_role,
+                               iam_role, main_account, organization_id)
         except ClientError as e:
             print(e)
     
